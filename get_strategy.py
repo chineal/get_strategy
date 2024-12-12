@@ -30,8 +30,6 @@ class MyHandler(BaseHTTPRequestHandler):
                 'name': self.server.main.strategy,
                 'port': self.server.main.port,
                 'count': self.server.main.count,
-                'buy': self.server.main.buy_flag,
-                'short': self.server.main.short_flag
             }
             response_json = json.dumps(response)
             
@@ -42,15 +40,14 @@ class MyHandler(BaseHTTPRequestHandler):
             query = parse_qs(parse.query)
             flag = query.get('flag', [''])[0]
             sign = query.get('sign', [''])[0]
+            mark = query.get('mark', ['0'])[0]
             key = query.get('key', [''])[0]
             stamp = query.get('stamp', [''])[0]
-            self.server.main.on_operate(flag, sign, key, stamp)
+            self.server.main.on_operate(flag, sign, mark, key, stamp)
         
-        elif parse.path == '/setting':
-            query = parse_qs(parse.query)
-            buy = query.get('buy', [''])[0]
-            short = query.get('short', [''])[0]
-            self.server.main.on_setting(0 != int(buy), 0 != int(short))
+        elif parse.path == '/reset':
+            target = query.get('target', [''])[0]
+            self.server.main.on_reset(target)
 
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
@@ -70,33 +67,34 @@ def update_config(config):
 class GetStrategy(CtaTemplate):
     running: bool = False
     bg: BarGenerator | None = None
-    port: int = 8123
-    count: int = 1
-    sgin: int = -1
-    target: int = 0
-    bid: float = 0.0
-    ask: float = 0.0
-    
-    parameters = ["port", "count", "sgin", "target", "bid", "ask"]
-
+    port: int = 8123    #端口
+    count: int = 1      #仓位
+    target: int = 0     #目标
+    bid: float = 0.0    #买一价
+    ask: float = 0.0    #卖一价
     strategy: str | None = None
-    buy_flag: bool = True
-    short_flag: bool = True
+    
+    parameters = ["port", "count", "target", "bid", "ask"]
 
     _server: MyServer | None = None
     _server_thread: threading.Thread | None = None
     _checker_thread: threading.Thread | None = None
 
-    _symbol: str | None = None
-    _state1: int = 0
-    _state2: int = 0
-    _targets: Queue | None = None
-    _reopen: int = -1
+    _symbol: str | None = None      #名称
+    _state1: int = 0                #买开状态
+    _state2: int = 0                #卖开状态
+    _recode: float = 0.0            #请求记录
+    _targets: Queue | None = None   #目标队列
+    _reopen: int = -1               #开仓重试记录
     _buy_orderids: list | None = None
     _sell_orderids: list | None = None
     _short_orderids: list | None = None
     _cover_orderids: list | None = None
-    _wait_server: bool = False
+    
+    _wait_time: int = 0             #等待时间
+    _wait_time_max: int = 100       #超时时间
+
+    _time_recode: int = 0           #命令执行间隔
 
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
@@ -135,17 +133,9 @@ class GetStrategy(CtaTemplate):
         self._checker_thread.deamon = True
         self._checker_thread.start()
 
-        if self.target == 0:
-            self.target = self.pos
-
-        if self.target > 0:
-            self._state1 = 1
-        if self.target < 0:
-            self._state2 = 1
-
+        self.on_reset(self.pos)         #数据初始化
         self.update_config(True)
         self.write_log('on_start')
-        self.put_event()
 
     def on_stop(self):
         # Callback when strategy is stopped.
@@ -166,25 +156,28 @@ class GetStrategy(CtaTemplate):
         self.bg.update_bar(bar)
         self.put_event()
 
-    def on_trade(self, trade: TradeData):
+    def on_trade(self, trade: TradeData):           #交易状态更新
         #pprint(trade)
-        if trade.offset == Offset.OPEN:
-            if trade.direction == Direction.LONG:
+        if trade.offset == Offset.OPEN:             #开仓
+            if trade.direction == Direction.LONG:   #买开
+                self._recode = self.ask
                 self._state1 = 1
                 self.target = 1
-            else:
+            else:                                   #卖开
+                self._recode = self.bid
                 self._state2 = 1
                 self.target = -1
-        else:
+        else:                                       #平仓
             self.sgin = -1
-            if trade.direction == Direction.LONG:
-                self._state2 = 0
-            else:
-                self._state1 = 0
             self.target = 0
+            if trade.direction == Direction.LONG:   #买平
+                self._state2 = 0
+            else:                                   #卖平
+                self._state1 = 0
         self.put_event()
         self.write_log('on_trade:%s 多:%d 空:%d' % (trade.orderid, self._state1, self._state2))
 
+        #删除已成交的交易记录
         order_id = "CTP.{}".format(trade.orderid)
         for buf_orderids in [self._buy_orderids, self._sell_orderids, self._short_orderids,self._cover_orderids]:
             if order_id in buf_orderids:
@@ -199,22 +192,25 @@ class GetStrategy(CtaTemplate):
         print("update order id:%s status:%s" % (order_id, order.status))
         
         if order.status != order.status.SUBMITTING:
-            self._wait_server = False
+            self._wait_time = self._wait_time_max
 
+        #排除非失效，拒绝的交易信息
         if order.status not in [order.status.CANCELLED, order.status.REJECTED]:
             return
         
+        #被拒交易处理
         if order.status == order.status.REJECTED:
-            if self.target == 0:
+            if self.target == 0:    #拒绝平仓
                 self._state1 = 0
                 self._state2 = 0
-            else:
+            else:                   #拒绝开仓
                 if self.target == 1 and self._state2 == 1:
                     self._state2 = 0
                 elif self.target == -1 and self._state1 == 1:
                     self._state1 = 0
             self.put_event()
 
+        #删除失败和被拒交易记录
         for buf_orderids in [self._buy_orderids, self._sell_orderids, self._short_orderids,self._cover_orderids]:
             if order_id in buf_orderids:
                 buf_orderids.remove(order_id)
@@ -223,49 +219,57 @@ class GetStrategy(CtaTemplate):
     def on_stop_order(self, stop: StopOrder):
         self.write_log('on_stop_order')
 
-    def on_setting(self, buy, short):
-        self.buy_flag = buy
-        self.short_flag = short
-        self.write_log('买开:%s, 卖开:%s' % ('开' if self.buy_flag else '关', '开' if self.short_flag else '关'))
+    #重置交易状态
+    def on_reset(self, target):
+        if self._targets.empty():
+            self.target = target
+            if self.target > 0:
+                self._state1 = 1
+            else:
+                self._state1 = 0
+            if self.target < 0:
+                self._state2 = 1
+            else:
+                self._state2 = 0
+            self.put_event()
 
-    def on_operate(self, flag, sign, key, stamp):
+    def on_operate(self, flag, sign, mark, key, stamp):
         self.write_log('请求:%s, %s:%s, state1:%s, state2:%s' % (self._symbol, self.sgin, self.target, self._state1, self._state2))
 
-        if key != 0 and int(self.sgin) != -1 and int(sign) != int(self.sgin):
-            self.write_log('请求冲突:%s, %s:%s, %s:%s' % (self._symbol, self.sgin, self.target, sign, key))
+        new_time = time.time()
+        if 55 >= new_time - self._time_recode:
+            self.write_log('请求频度异常！')
             return
-
+        self._time_recode = new_time
+        
         if key == '1' and self._state1 == 0:
             self.write_log('请求买开:%s, 周期码:%s, %s元' % (self._symbol, sign, self.ask))
-            if self.buy_flag:
-                self._targets.put(1)
-                self.sgin = int(sign)
-                self.put_event()
-            else:
-                self.write_log('买开已关闭')
+            self._targets.put(1)
+            self.put_event()
             return
         
         if key == '2' and self._state2 == 0:
             self.write_log('请求卖开:%s, 周期码:%s, %s元' % (self._symbol, sign, self.bid))
-            if self.short_flag:
-                self._targets.put(-1)
-                self.sgin = int(sign)
-                self.put_event()
-            else:
-                self.write_log('卖开已关闭')
+            self._targets.put(-1)
+            self.put_event()
             return
         
         if key == '0':
             self.write_log('全平:%s, %s元, %s元' % (self._symbol, self.ask, self.bid))
         elif (key == '3' or key == '5') and self.target != 0:
+            if mark and self.ask < self._recode:
+                self.write_log('抛弃买平:%s, 比价抛弃 周期码:%s, %s元 : %s元' % (self._symbol, sign, self._recode, self.ask))
+                return
             self.write_log('请求买平:%s, 周期码:%s, %s元' % (self._symbol, sign, self.ask))
         elif (key == '4' or key == '6') and self.target != 0:
+            if mark and self.bid > self._recode:
+                self.write_log('抛弃买平:%s, 比价抛弃 周期码:%s, %s元 : %s元' % (self._symbol, sign, self._recode, self.bid))
+                return
             self.write_log('请求卖平:%s, 周期码:%s, %s元' % (self._symbol, sign, self.bid))
         else:
+            self.write_log('重复请求！')
             return
-        #self._cancel_count = 0
         self._targets.put(0)
-        self.sgin = int(sign)
         self.put_event()
 
     def server_run(self):
@@ -286,7 +290,8 @@ class GetStrategy(CtaTemplate):
                 #if self._cancel_count > 100:
                 time.sleep(0.5)
 
-                if self._wait_server:
+                if self._wait_time < self._wait_time_max:
+                    self._wait_time += 1
                     continue
 
                 if self.target == 9:
@@ -296,7 +301,7 @@ class GetStrategy(CtaTemplate):
 
                 if (self.target == 0 or self.target == -1) and self._state1 == 1:
                     if len(self._sell_orderids) == 0:
-                        self._wait_server = True
+                        self._wait_time = 0
                         self._sell_orderids = self.sell(self.bid - 1, self.count)
                         self.write_log('卖平:%s, %s元, 目标:%s, 多:%s, 标识:%s'
                                        % (self._symbol, self.ask, self.target, self._state1, self._sell_orderids))
@@ -306,7 +311,7 @@ class GetStrategy(CtaTemplate):
 
                 if (self.target == 0 or self.target == 1) and self._state2 == 1:
                     if len(self._cover_orderids) == 0:
-                        self._wait_server = True
+                        self._wait_time = 0
                         self._cover_orderids = self.cover(self.ask + 1, self.count)
                         self.write_log('买平:%s, %s元, 目标:%s, 空:%s, 标识:%s'
                                        % (self._symbol, self.bid, self.target, self._state2, self._cover_orderids))
@@ -317,7 +322,7 @@ class GetStrategy(CtaTemplate):
                 if self.target == 1 and self._state1 == 0 and self._reopen < 3:
                     self._reopen += 1
                     if len(self._buy_orderids) == 0:
-                        self._wait_server = True
+                        self._wait_time = 0
                         self._buy_orderids = self.buy(self.ask + 1, self.count)
                         self.write_log('买开:%s, %s元, 目标:%s, 多:%s, 标识:%s'
                                        % (self._symbol, self.bid, self.target, self._state1, self._buy_orderids))
@@ -328,7 +333,7 @@ class GetStrategy(CtaTemplate):
                 if self.target == -1 and self._state2 == 0 and self._reopen < 3:
                     self._reopen += 1
                     if len(self._short_orderids) == 0:
-                        self._wait_server = True
+                        self._wait_time = 0
                         self._short_orderids = self.short(self.bid - 1, self.count)
                         self.write_log('卖开:%s, %s元, 目标:%s, 空:%s, 标识:%s'
                                        % (self._symbol, self.ask, self.target, self._state2, self._short_orderids))
@@ -336,9 +341,9 @@ class GetStrategy(CtaTemplate):
                         self.my_cancel()
                     continue
 
-                if self._reopen >= 3 and ((
-                    self.target == 1 and self._state1 == 0) or (
-                        self.target == -1 and self._state2 == 0)):
+                if self._reopen >= 3 and (
+                    (self.target == 1 and self._state1 == 0) or
+                        (self.target == -1 and self._state2 == 0)):
                     self.write_log('开仓失败:%s, 目标:%s' % (self._symbol, self.target))
                     self.target = 0
                     self._buy_orderids = []
