@@ -168,7 +168,6 @@ class GetStrategy(CtaTemplate):
                 self._state2 = 1
                 self.target = -1
         else:                                       #平仓
-            self.sgin = -1
             self.target = 0
             if trade.direction == Direction.LONG:   #买平
                 self._state2 = 0
@@ -234,7 +233,7 @@ class GetStrategy(CtaTemplate):
             self.put_event()
 
     def on_operate(self, flag, sign, mark, key, stamp):
-        self.write_log('请求:%s, %s:%s, state1:%s, state2:%s' % (self._symbol, self.sgin, self.target, self._state1, self._state2))
+        self.write_log('请求:%s, target:%s, state1:%s, state2:%s' % (self._symbol, self.target, self._state1, self._state2))
 
         new_time = time.time()
         if 55 >= new_time - self._time_recode:
@@ -351,7 +350,6 @@ class GetStrategy(CtaTemplate):
                     self.put_event()
 
                 if self.target == 0 and self._state1 == 0 and self._state2 == 0:
-                    self.sgin = -1
                     self.put_event()
 
                 break
@@ -365,9 +363,8 @@ class GetStrategy(CtaTemplate):
 
             if init:
                 if config[self._symbol].get("sgin") is not None:
-                    self.sgin = int(config[self._symbol]['sgin'])
+                    pass
             else:
-                config[self._symbol]['sgin'] = int(self.sgin)
                 update_config(config)
     
     def my_cancel(self):
